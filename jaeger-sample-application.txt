@@ -1,0 +1,394 @@
+************************************************** Step 1 — Building the Sample Application
+nano ./frontend/frontend.py
+import os
+import requests
+from flask import Flask
+app = Flask(__name__)
+
+def get_counter(counter_endpoint):
+    counter_response = requests.get(counter_endpoint)
+    return counter_response.text
+
+def increase_counter(counter_endpoint):
+    counter_response = requests.post(counter_endpoint)
+    return counter_response.text
+
+@app.route('/')
+def hello_world():
+    counter_service = os.environ.get('COUNTER_ENDPOINT', default="https://localhost:5000")
+    counter_endpoint = f'{counter_service}/api/counter'
+    counter = get_counter(counter_endpoint)
+
+    increase_counter(counter_endpoint)
+
+    return f"""Hello, World!
+
+You're visitor number {counter} in here!\n\n"""
+
+------------------
+nano ./frontend/Dockerfile
+FROM alpine:3.8
+
+RUN apk add --no-cache py3-pip python3 && \
+    pip3 install flask requests
+
+COPY . /usr/src/frontend
+
+ENV FLASK_APP frontend.py
+
+WORKDIR /usr/src/frontend
+
+CMD flask run --host=0.0.0.0 --port=8000
+
+-------------------
+docker login --username=your_username --password=your_password
+docker build -t your_username/do-visit-counter-frontend:v1 ./frontend
+docker push your_username/do-visit-counter-frontend:v1
+--------------------
+nano ./backend/backend.py
+from random import randint
+from time import sleep
+
+from flask import request
+from flask import Flask
+app = Flask(__name__)
+
+counter_value = 1
+
+def get_counter():
+    return str(counter_value)
+
+def increase_counter():
+    global counter_value
+    int(counter_value)
+    sleep(randint(1,10))
+    counter_value += 1
+    return str(counter_value)
+
+@app.route('/api/counter', methods=['GET', 'POST'])
+def counter():
+    if request.method == 'GET':
+        return get_counter()
+    elif request.method == 'POST':
+        return increase_counter()
+-------------------------------------
+nano ./backend/Dockerfile
+FROM alpine:3.8
+
+RUN apk add --no-cache py3-pip python3 && \
+    pip3 install flask
+
+COPY . /usr/src/backend
+
+ENV FLASK_APP backend.py
+
+WORKDIR /usr/src/backend
+
+CMD flask run --host=0.0.0.0 --port=5000
+------------------------------
+docker build -t your_username/do-visit-counter-backend:v1 ./backend
+docker push your_username/do-visit-counter-backend:v1
+-----------------------------
+********************************************** Step 2 — Deploying and Testing the Application
+.
+├── backend
+│   ├── Dockerfile
+│   └── backend.py
+└── frontend
+    ├── Dockerfile
+    └── frontend.py
+nano ./frontend/deploy_frontend.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: do-visit-counter-frontend
+  labels:
+    name: do-visit-counter-frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: do-visit-counter-frontend
+  template:
+    metadata:
+      labels:
+        app: do-visit-counter-frontend
+    spec:
+      containers:
+        - name: do-visit-counter-frontend
+          image: your_dockerhub_username/do-visit-counter-frontend:v1
+          imagePullPolicy: Always
+          env:
+            - name: COUNTER_ENDPOINT
+              value: "http://do-visit-counter-backend.default.svc.cluster.local:5000"
+          ports:
+            - name: frontend-port
+              containerPort: 8000
+              protocol: TCP
+-------------------------------------
+nano ./backend/deploy_backend.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: do-visit-counter-backend
+  labels:
+    name: do-visit-counter-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: do-visit-counter-backend
+  template:
+    metadata:
+      labels:
+        app: do-visit-counter-backend
+    spec:
+      containers:
+        - name: do-visit-counter-backend
+          image: your_dockerhub_username/do-visit-counter-backend:v1
+          imagePullPolicy: Always
+          ports:
+            - name: backend-port
+              containerPort: 5000
+              protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+    name: do-visit-counter-backend
+spec:
+    selector:
+        app: do-visit-counter-backend
+    ports:
+        - protocol: TCP
+          port: 5000
+          targetPort: 5000
+-----------------------------------------------
+kubectl apply -f ./frontend/deploy_frontend.yaml
+kubectl apply -f ./backend/deploy_backend.yaml
+kubectl get pods
+kubectl port-forward $(kubectl get pods -l=app="do-visit-counter-frontend" -o name) 8000:8000
+*** in second terminal
+for i in 1 2 3; do curl localhost:8000; done
+
+************************************************* Step 3 — Deploying Jaeger
+kubectl create -f https://raw.githubusercontent.com/jaegertracing/jaeger-operator/master/deploy/crds/jaegertracing.io_jaegers_crd.yaml
+kubectl create -f https://raw.githubusercontent.com/jaegertracing/jaeger-operator/master/deploy/service_account.yaml
+kubectl create -f https://raw.githubusercontent.com/jaegertracing/jaeger-operator/master/deploy/role.yaml
+kubectl create -f https://raw.githubusercontent.com/jaegertracing/jaeger-operator/master/deploy/role_binding.yaml
+kubectl create -f https://raw.githubusercontent.com/jaegertracing/jaeger-operator/master/deploy/operator.yaml
+
+kubectl apply -f - <<EOF
+apiVersion: jaegertracing.io/v1
+kind: Jaeger
+metadata:
+  name: simplest
+EOF
+
+kubectl get pods
+kubectl port-forward $(kubectl get pods -l=app="jaeger" -o name) 16686:16686
+
+http://localhost:16686
+
+***************************************************** Step 4 — Adding Instrumentation
+nano ./frontend/frontend.py
+import os
+import requests
+from flask import Flask
+from jaeger_client import Config
+from flask_opentracing import FlaskTracing
+
+app = Flask(__name__)
+config = Config(
+    config={
+        'sampler':
+        {'type': 'const',
+         'param': 1},
+                        'logging': True,
+                        'reporter_batch_size': 1,}, 
+                        service_name="service")
+jaeger_tracer = config.initialize_tracer()
+tracing = FlaskTracing(jaeger_tracer, True, app)
+
+def get_counter(counter_endpoint):
+    counter_response = requests.get(counter_endpoint)
+    return counter_response.text
+
+def increase_counter(counter_endpoint):
+    counter_response = requests.post(counter_endpoint)
+    return counter_response.text
+
+@app.route('/')
+def hello_world():
+    counter_service = os.environ.get('COUNTER_ENDPOINT', default="https://localhost:5000")
+    counter_endpoint = f'{counter_service}/api/counter'
+    counter = get_counter(counter_endpoint)
+
+    increase_counter(counter_endpoint)
+
+    return f"""Hello, World!
+
+You're visitor number {counter} in here!\n\n"""
+------------------------
+nano ./backend/backend.py
+from random import randint
+from time import sleep
+
+from flask import Flask
+from flask import request
+from jaeger_client import Config
+from flask_opentracing import FlaskTracing
+
+
+app = Flask(__name__)
+config = Config(
+    config={
+        'sampler':
+        {'type': 'const',
+         'param': 1},
+                        'logging': True,
+                        'reporter_batch_size': 1,}, 
+                        service_name="service")
+jaeger_tracer = config.initialize_tracer()
+tracing = FlaskTracing(jaeger_tracer, True, app)
+
+counter_value = 1
+
+def get_counter():
+    return str(counter_value)
+
+def increase_counter():
+    global counter_value
+    int(counter_value)
+    sleep(randint(1,10))
+    counter_value += 1
+    return str(counter_value)
+
+@app.route('/api/counter', methods=['GET', 'POST'])
+def counter():
+    if request.method == 'GET':
+        return get_counter()
+    elif request.method == 'POST':
+        return increase_counter()
+-----------------------
+nano ./frontend/Dockerfile
+FROM alpine:3.8
+
+RUN apk add --no-cache py3-pip python3 && \
+    pip3 install flask requests Flask-Opentracing jaeger-client
+
+COPY . /usr/src/frontend
+
+ENV FLASK_APP frontend.py
+
+WORKDIR /usr/src/frontend
+
+CMD flask run --host=0.0.0.0 --port=8000
+----------------
+nano ./backend/Dockerfile
+FROM alpine:3.8
+
+RUN apk add --no-cache py3-pip python3 && \
+    pip3 install flask Flask-Opentracing jaeger-client
+
+COPY . /usr/src/backend
+
+ENV FLASK_APP backend.py
+
+WORKDIR /usr/src/backend
+
+CMD flask run --host=0.0.0.0 --port=5000
+----------------
+docker build -t your_username/do-visit-counter-frontend:v2 ./frontend
+docker push your_username/do-visit-counter-frontend:v2
+
+docker build -t your_username/do-visit-counter-backend:v2 ./backend
+docker push your_username/do-visit-counter-backend:v2
+
+-------
+nano ./frontend/deploy_frontend.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: do-visit-counter-frontend
+  labels:
+    name: do-visit-counter-frontend
+  annotations:
+    "sidecar.jaegertracing.io/inject": "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: do-visit-counter-frontend
+  template:
+    metadata:
+      labels:
+        app: do-visit-counter-frontend
+    spec:
+      containers:
+        - name: do-visit-counter-frontend
+             image: your_dockerhub_username/do-visit-counter-frontend:v2
+          imagePullPolicy: Always
+          env:
+            - name: COUNTER_ENDPOINT
+              value: "http://do-visit-counter-backend.default.svc.cluster.local:5000"
+          ports:
+            - name: frontend-port
+              containerPort: 8000
+              protocol: TCP
+----------------------
+nano ./backend/deploy_backend.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: do-visit-counter-backend
+  labels:
+    name: do-visit-counter-backend
+  annotations:
+    "sidecar.jaegertracing.io/inject": "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: do-visit-counter-backend
+  template:
+    metadata:
+      labels:
+        app: do-visit-counter-backend
+    spec:
+      containers:
+        - name: do-visit-counter-backend
+             image: your_dockerhub_username/do-visit-counter-backend:v2
+          imagePullPolicy: Always
+          ports:
+            - name: backend-port
+              containerPort: 5000
+              protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+    name: do-visit-counter-backend
+spec:
+    selector:
+        app: do-visit-counter-backend
+    ports:
+        - protocol: TCP
+          port: 5000
+          targetPort: 5000
+---------------------------
+kubectl delete -f ./frontend/deploy_frontend.yaml
+kubectl delete -f ./backend/deploy_backend.yaml
+kubectl apply -f ./frontend/deploy_frontend.yaml
+kubectl apply -f ./backend/deploy_backend.yaml
+kubectl get pods
+*********************************************************Step 5 — Investigating Traces in Jaeger
+kubectl port-forward $(kubectl get pods -l=app="do-visit-counter-frontend" -o name) 8000:8000
+*** in the second terminal
+kubectl port-forward $(kubectl get pods -l=app="jaeger" -o name) 16686:16686
+*** In the third terminal
+for i in 0 1 2 3 4 5 6 7 8 9; do curl localhost:8000; done
+
+http://localhost:16686
+Set the Service dropdown menu to service and change limit results to 30. Press Find Traces.
+
